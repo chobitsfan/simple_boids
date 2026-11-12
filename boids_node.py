@@ -31,9 +31,12 @@ class BoidsNode(Node):
         self.max_speed = p('max_speed', 2.0).value          # [m/s]
         self.max_acc = p('max_accel', 2.0).value            # [m/s^2]
         self.timeout = p('timeout', 0.5).value              # stop if no input [s]
+        # alpha-beta filter gains (0..1]: lower = smoother but laggier; 1.0/1.0 = no filtering
+        self.alpha = p('filter_alpha', 0.5).value           # position correction gain
+        self.beta = p('filter_beta', 0.1).value             # velocity correction gain
 
         self.vel = np.zeros(3)   # current commanded velocity (local frame)
-        self.prev = {}           # id -> (position, time) for velocity estimation
+        self.tracks = {}         # id -> (filtered position, filtered relative velocity, time)
         self.last_t = None
 
         self.pub = self.create_publisher(Twist, '~/cmd_vel', 10)
@@ -45,20 +48,29 @@ class BoidsNode(Node):
         dt = 0.0 if self.last_t is None else min(now - self.last_t, self.timeout)
         self.last_t = now
 
-        pos, rel_vel, seen = [], [], {}
+        pos, rel_vel, tracks = [], [], {}
         for m in msg.markers:
             if m.action != Marker.ADD:
                 continue
-            q = np.array([m.pose.position.x, m.pose.position.y, m.pose.position.z])
-            seen[m.id] = (q, now)
+            z = np.array([m.pose.position.x, m.pose.position.y, m.pose.position.z])
+            q, v, valid_v = z, np.zeros(3), False
+            if m.id in self.tracks:
+                q0, v0, t0 = self.tracks[m.id]
+                h = now - t0
+                if 0.0 < h < self.timeout:
+                    # alpha-beta filter: predict with constant velocity, correct with residual
+                    q_pred = q0 + v0 * h
+                    r = z - q_pred
+                    q = q_pred + self.alpha * r
+                    v = v0 + (self.beta / h) * r
+                    valid_v = True
+            tracks[m.id] = (q, v, now)
             if np.linalg.norm(q) > self.radius:
                 continue
             pos.append(q)
-            if m.id in self.prev:
-                q0, t0 = self.prev[m.id]
-                if 0.0 < now - t0 < self.timeout:
-                    rel_vel.append((q - q0) / (now - t0))
-        self.prev = seen
+            if valid_v:
+                rel_vel.append(v)
+        self.tracks = tracks
 
         acc = np.zeros(3)
         if pos:
@@ -79,7 +91,7 @@ class BoidsNode(Node):
         if self.last_t is not None and now - self.last_t > self.timeout:
             self.vel[:] = 0.0
             self.last_t = None
-            self.prev.clear()
+            self.tracks.clear()
             self.publish(self.vel)
 
     def publish(self, v):
