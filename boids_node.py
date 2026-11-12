@@ -15,7 +15,7 @@ Rules (all computed in the local frame, so the drone itself sits at 0,0,0):
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import TwistStamped
 from visualization_msgs.msg import Marker, MarkerArray
 
 
@@ -39,8 +39,8 @@ class BoidsNode(Node):
         self.tracks = {}         # id -> (filtered position, filtered relative velocity, time)
         self.last_t = None
 
-        self.pub = self.create_publisher(Twist, '~/cmd_vel', 10)
-        self.create_subscription(MarkerArray, '~/neighbors', self.on_neighbors, 10)
+        self.pub = self.create_publisher(TwistStamped, '~/cmd_vel', 10)
+        self.create_subscription(MarkerArray, 'markers', self.on_neighbors, 10)
         self.create_timer(0.1, self.watchdog)
 
     def on_neighbors(self, msg: MarkerArray):
@@ -95,8 +95,10 @@ class BoidsNode(Node):
             self.publish(self.vel)
 
     def publish(self, v):
-        t = Twist()
-        t.linear.x, t.linear.y, t.linear.z = map(float, v)
+        t = TwistStamped()
+        t.header.frame_id = "body"
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.twist.linear.x, t.twist.linear.y, t.twist.linear.z = map(float, v)
         self.pub.publish(t)
 
 
