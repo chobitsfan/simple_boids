@@ -23,13 +23,13 @@ class BoidsNode(Node):
     def __init__(self):
         super().__init__('boids')
         p = self.declare_parameter
-        self.radius = p('neighbor_radius', 10.0).value     # perception range [m]
-        self.sep_dist = p('separation_distance', 2.0).value
+        self.radius = p('neighbor_radius', 5.0).value     # perception range [m]
+        self.sep_dist = p('separation_distance', 1.5).value
         self.w_coh = p('w_cohesion', 0.5).value
         self.w_sep = p('w_separation', 2.0).value
         self.w_ali = p('w_alignment', 1.0).value
-        self.max_speed = p('max_speed', 2.0).value          # [m/s]
-        self.max_acc = p('max_accel', 2.0).value            # [m/s^2]
+        self.max_speed = p('max_speed', 1.0).value          # [m/s]
+        self.max_acc = p('max_accel', 0.5).value            # [m/s^2]
         self.timeout = p('timeout', 0.5).value              # stop if no input [s]
         # alpha-beta filter gains (0..1]: lower = smoother but laggier; 1.0/1.0 = no filtering
         self.alpha = p('filter_alpha', 0.5).value           # position correction gain
