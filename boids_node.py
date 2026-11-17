@@ -4,13 +4,16 @@
 Sub:  ~/neighbors (visualization_msgs/MarkerArray)
       one marker per observed neighbor; only `id` and `pose.position` are used,
       position expressed in the drone's local frame (drone at origin).
-Pub:  ~/cmd_vel (geometry_msgs/Twist), linear velocity in the drone's local frame.
+Sub:  body_rate (geometry_msgs/TwistStamped), optional; drone's own angular rate
+      [rad/s] in twist.angular, same body frame (FLU) as the markers.
+Pub:  ~/cmd_vel (geometry_msgs/TwistStamped), linear velocity in the drone's local frame.
 
 Rules (all computed in the local frame, so the drone itself sits at 0,0,0):
   cohesion   -> steer toward the neighbors' centroid:        mean(p_i)
   separation -> steer away from neighbors that are too close: sum(-p_i / |p_i|^2)
   alignment  -> match neighbors' velocity. Since p_i is relative, d(p_i)/dt is
-                (v_i - v_self), which is exactly the alignment steering term.
+                (v_i - v_self) - w x p_i, where w is the body rate; the filter
+                removes the rotation part, leaving the alignment steering term.
 """
 import numpy as np
 import rclpy
@@ -40,16 +43,26 @@ class BoidsNode(Node):
         self.vel = np.zeros(3)   # current commanded velocity (local frame)
         self.tracks = {}         # id -> (filtered position, filtered relative velocity, time)
         self.last_t = None
+        self.omega = np.zeros(3)  # own body rate [rad/s]
+        self.omega_t = None
 
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.pub = self.create_publisher(TwistStamped, '~/cmd_vel', qos)
         self.create_subscription(MarkerArray, 'markers', self.on_neighbors, qos)
+        self.create_subscription(TwistStamped, 'body_rate', self.on_body_rate, qos)
         self.create_timer(0.1, self.watchdog)
+
+    def on_body_rate(self, msg: TwistStamped):
+        a = msg.twist.angular
+        self.omega = np.array([a.x, a.y, a.z])
+        self.omega_t = self.get_clock().now().nanoseconds * 1e-9
 
     def on_neighbors(self, msg: MarkerArray):
         now = self.get_clock().now().nanoseconds * 1e-9
         dt = 0.0 if self.last_t is None else min(now - self.last_t, self.timeout)
         self.last_t = now
+        # no (recent) body rate -> assume the frame does not rotate
+        w = self.omega if self.omega_t is not None and now - self.omega_t < self.timeout else np.zeros(3)
 
         pos, rel_vel, tracks = [], [], {}
         for m in msg.markers:
@@ -61,11 +74,13 @@ class BoidsNode(Node):
                 q0, v0, t0 = self.tracks[m.id]
                 h = now - t0
                 if 0.0 < h < self.timeout:
-                    # alpha-beta filter: predict with constant velocity, correct with residual
-                    q_pred = q0 + v0 * h
+                    # alpha-beta filter: predict with constant velocity in a frame rotating
+                    # at w (both q and v rotate by -w x), correct with residual
+                    q_pred = q0 + (v0 - np.cross(w, q0)) * h
+                    v_pred = v0 - np.cross(w, v0) * h
                     r = z - q_pred
                     q = q_pred + self.alpha * r
-                    v = v0 + (self.beta / h) * r
+                    v = v_pred + (self.beta / h) * r
                     valid_v = True
             tracks[m.id] = (q, v, now)
             if np.linalg.norm(q) > self.radius:
@@ -86,6 +101,8 @@ class BoidsNode(Node):
         if rel_vel:
             acc += self.w_ali * np.mean(rel_vel, axis=0)
 
+        # keep the previous command fixed in the world while the body rotates
+        self.vel = self.vel - np.cross(w, self.vel) * dt
         self.vel = clamp(self.vel + clamp(acc, self.max_acc) * dt, self.max_speed)
         self.publish(self.vel)
 
