@@ -29,11 +29,12 @@ class BoidsNode(Node):
         self.w_sep = p('w_separation', 2.0).value
         self.w_ali = p('w_alignment', 1.0).value
         self.max_speed = p('max_speed', 1.0).value          # [m/s]
-        self.max_acc = p('max_accel', 0.5).value            # [m/s^2]
-        self.timeout = p('timeout', 0.5).value              # stop if no input [s]
+        self.max_acc = p('max_accel', 2.0).value            # [m/s^2]
+        self.timeout = p('timeout', 1.0).value              # stop if no input [s]
         # alpha-beta filter gains (0..1]: lower = smoother but laggier; 1.0/1.0 = no filtering
-        self.alpha = p('filter_alpha', 0.5).value           # position correction gain
-        self.beta = p('filter_beta', 0.1).value             # velocity correction gain
+        # tuned per update on ~21 Hz WhyCon data (about 1 cm depth noise)
+        self.alpha = p('filter_alpha', 0.6).value           # position correction gain
+        self.beta = p('filter_beta', 0.2).value             # velocity correction gain
 
         self.vel = np.zeros(3)   # current commanded velocity (local frame)
         self.tracks = {}         # id -> (filtered position, filtered relative velocity, time)
