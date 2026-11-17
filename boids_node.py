@@ -15,6 +15,7 @@ Rules (all computed in the local frame, so the drone itself sits at 0,0,0):
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import TwistStamped
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -40,8 +41,9 @@ class BoidsNode(Node):
         self.tracks = {}         # id -> (filtered position, filtered relative velocity, time)
         self.last_t = None
 
-        self.pub = self.create_publisher(TwistStamped, '~/cmd_vel', 10)
-        self.create_subscription(MarkerArray, 'markers', self.on_neighbors, 10)
+        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.pub = self.create_publisher(TwistStamped, '~/cmd_vel', qos)
+        self.create_subscription(MarkerArray, 'markers', self.on_neighbors, qos)
         self.create_timer(0.1, self.watchdog)
 
     def on_neighbors(self, msg: MarkerArray):
