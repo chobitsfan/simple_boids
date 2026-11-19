@@ -49,7 +49,7 @@ class BoidsNode(Node):
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.pub = self.create_publisher(TwistStamped, '~/cmd_vel', qos)
         self.create_subscription(MarkerArray, 'markers', self.on_neighbors, qos)
-        self.create_subscription(TwistStamped, 'body_rate', self.on_body_rate, qos)
+        self.create_subscription(TwistStamped, 'fc_vel', self.on_body_rate, qos)
         self.create_timer(0.1, self.watchdog)
 
     def on_body_rate(self, msg: TwistStamped):
