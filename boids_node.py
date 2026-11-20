@@ -14,7 +14,10 @@ Pub:  ~/cmd_vel (geometry_msgs/TwistStamped), linear velocity in the drone's loc
 
 Rules (all computed in the local frame, so the drone itself sits at 0,0,0):
   cohesion   -> steer toward the neighbors' centroid:        mean(p_i)
-  separation -> steer away from neighbors that are too close: sum(-p_i / |p_i|^2)
+                (separate horizontal and vertical gains; the vertical one keeps
+                 neighbors inside the camera's narrow vertical view)
+  separation -> steer away from neighbors that are too close: sum(-p_i / |p_i|^2),
+                horizontal component only
   alignment  -> match neighbors' velocity. Since p_i is relative, d(p_i)/dt is
                 (v_i - v_self) - w x p_i, where w is the body rate; the filter
                 removes the rotation part, leaving the alignment steering term.
@@ -37,7 +40,10 @@ class BoidsNode(Node):
         # (2026-11-19 DataFlash log: first-order lag 0.82 s + 0.12 s delay in x,
         #  1.0 s + 0.18 s in y; PSC_JERK_NE 5, WP_ACC 2.5)
         self.sep_dist = p('separation_distance', 1.8).value
-        self.w_coh = p('w_cohesion', 0.25).value
+        self.w_coh = p('w_cohesion', 0.25).value            # horizontal
+        # vertical cohesion (match height); tuned on the 2026-11-19 16:03 flight replay:
+        # higher gains chase the apparent height change caused by A's own pitch
+        self.w_height = p('w_height', 0.75).value
         self.w_sep = p('w_separation', 4.0).value
         self.w_ali = p('w_alignment', 3.0).value              # also damps closing speed
         self.max_speed = p('max_speed', 1.0).value          # [m/s]
@@ -115,11 +121,17 @@ class BoidsNode(Node):
         acc = np.zeros(3)
         if pos:
             P = np.array(pos)
-            acc += self.w_coh * P.mean(axis=0)
+            c = P.mean(axis=0)
+            acc += self.w_coh * np.array([c[0], c[1], 0.0])     # horizontal cohesion
+            acc[2] += self.w_height * c[2]                      # height matching
             d = np.linalg.norm(P, axis=1)
             close = (d > 1e-6) & (d < self.sep_dist)
             if close.any():
-                acc += self.w_sep * (-P[close] / d[close, None] ** 2).sum(axis=0)
+                # horizontal only: keep apart side by side instead of stacking
+                # (a neighbor in the camera view is never far above or below)
+                sep = (-P[close] / d[close, None] ** 2).sum(axis=0)
+                sep[2] = 0.0
+                acc += self.w_sep * sep
         if rel_vel:
             acc += self.w_ali * np.mean(rel_vel, axis=0)
 
