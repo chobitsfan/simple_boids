@@ -11,6 +11,9 @@ Sub:  fc_rdy (std_msgs/Bool); true while the flight controller follows velocity
       commands. While it is false (or never received) the command is held at zero
       (anti-windup); when it turns true, the command restarts from fc_vel.
 Pub:  ~/cmd_vel (geometry_msgs/TwistStamped), linear velocity in the drone's local frame.
+      twist.angular.z is NOT a rate: it is a relative heading change [rad] (FLU, positive
+      = turn left) toward the neighbors' bearing, re-sent with every message; 0 = hold
+      the current heading target. The bridge sends it as relative yaw (BODY_FRD, -z).
 
 Rules (all computed in the local frame, so the drone itself sits at 0,0,0):
   cohesion   -> steer toward the neighbors' centroid:        mean(p_i)
@@ -49,6 +52,12 @@ class BoidsNode(Node):
         self.max_speed = p('max_speed', 1.0).value          # [m/s]
         self.max_acc = p('max_accel', 2.0).value            # [m/s^2]
         self.timeout = p('timeout', 1.0).value              # stop if no input [s]
+        # yaw tracking: the FC adds each relative heading change onto its own heading
+        # target, so the turn rate is (step / message interval). Sending
+        # yaw_gain * bearing * dt makes the gain a rate gain [1/s], independent of the
+        # marker rate (0 disables)
+        self.yaw_gain = p('yaw_gain', 1.5).value
+        self.max_yaw_rate = p('max_yaw_rate', 0.5).value    # [rad/s], below ATC_RATE_WPY_MAX
         # alpha-beta filter gains (0..1]: lower = smoother but laggier; 1.0/1.0 = no filtering
         # tuned per update on ~21 Hz WhyCon data (about 1 cm depth noise)
         self.alpha = p('filter_alpha', 0.6).value           # position correction gain
@@ -119,9 +128,15 @@ class BoidsNode(Node):
         self.tracks = tracks
 
         acc = np.zeros(3)
+        yaw = 0.0
         if pos:
             P = np.array(pos)
             c = P.mean(axis=0)
+            if c[0] > 0.0:
+                # turn toward the neighbors' horizontal bearing
+                rate = np.clip(self.yaw_gain * np.arctan2(c[1], c[0]),
+                               -self.max_yaw_rate, self.max_yaw_rate)
+                yaw = float(rate * dt)
             acc += self.w_coh * np.array([c[0], c[1], 0.0])     # horizontal cohesion
             acc[2] += self.w_height * c[2]                      # height matching
             d = np.linalg.norm(P, axis=1)
@@ -139,6 +154,7 @@ class BoidsNode(Node):
         if not ready:
             # FC is not following (not in Guided): don't let the command wind up
             self.vel = np.zeros(3)
+            yaw = 0.0
         else:
             if not self.following:
                 # (re)entering Guided: continue from what A is actually doing
@@ -147,7 +163,7 @@ class BoidsNode(Node):
             self.vel = self.vel - np.cross(w, self.vel) * dt
             self.vel = clamp(self.vel + clamp(acc, self.max_acc) * dt, self.max_speed)
         self.following = ready
-        self.publish(self.vel)
+        self.publish(self.vel, yaw)
 
     def watchdog(self):
         now = self.get_clock().now().nanoseconds * 1e-9
@@ -157,11 +173,12 @@ class BoidsNode(Node):
             self.tracks.clear()
             self.publish(self.vel)
 
-    def publish(self, v):
+    def publish(self, v, yaw=0.0):
         t = TwistStamped()
         t.header.frame_id = "body"
         t.header.stamp = self.get_clock().now().to_msg()
         t.twist.linear.x, t.twist.linear.y, t.twist.linear.z = map(float, v)
+        t.twist.angular.z = float(yaw)
         self.pub.publish(t)
 
 
