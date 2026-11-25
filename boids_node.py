@@ -24,11 +24,12 @@ Rules (all computed in the local frame, so the drone itself sits at 0,0,0):
   alignment  -> match neighbors' velocity: v_i - v_self, where v_i is neighbor i's
                 ground velocity and v_self is ours (fc_vel), both in body axes (FLU).
                 Since p_i is relative, d(p_i)/dt = (v_i - v_self) - w x p_i
-                (w = body rate). The filter estimates v_i using v_self in its
-                prediction, and the steering uses the current v_self.
-                This keeps the damping of v_self out of the slow camera filter (in the
-                2026-11-25 flight the filtered relative velocity lagged ~0.24 s and the
-                damping loop oscillated at 0.4 Hz); a bias in fc_vel cancels out.
+                (w = body rate). The filter estimates v_i using the measured v_self
+                in its prediction, so the slow camera filter only smooths v_i.
+                In the steering, v_self is a blend of the measured velocity (reacts
+                to drift, but through our ~0.3 s response) and our own command (no
+                delay); damp_measured sets the share. Damping only the measured
+                velocity oscillated at 0.4 Hz in the 2026-11-25 flights.
 """
 import numpy as np
 import rclpy
@@ -57,6 +58,11 @@ class BoidsNode(Node):
         self.w_height = p('w_height', 0.75).value
         self.w_sep = p('w_separation', 6.0).value
         self.w_ali = p('w_alignment', 3.0).value              # also damps closing speed
+        # share of measured (fc_vel) vs commanded velocity in alignment's v_self.
+        # The measured part closes a loop through our ~0.3 s command response
+        # (2026-11-25 14:02 log: x 0.10+0.30 s, y 0.08+0.36 s, z 0.28+0.30 s);
+        # 1.0 with w_alignment 3 oscillated at 0.4 Hz, 0.5 keeps 40+ deg phase margin
+        self.damp_meas = p('damp_measured', 0.5).value
         self.max_speed = p('max_speed', 1.0).value          # [m/s]
         self.max_acc = p('max_accel', 2.0).value            # [m/s^2]
         self.timeout = p('timeout', 1.0).value              # stop if no input [s]
@@ -110,7 +116,7 @@ class BoidsNode(Node):
         w = self.omega if fc_ok else np.zeros(3)
         va = self.v_meas if fc_ok else np.zeros(3)
 
-        pos, rel_vel, tracks = [], [], {}
+        pos, nb_vel, tracks = [], [], {}
         for m in msg.markers:
             if m.action != Marker.ADD:
                 continue
@@ -134,7 +140,7 @@ class BoidsNode(Node):
                 continue
             pos.append(q)
             if valid_v:
-                rel_vel.append(u - va)
+                nb_vel.append(u)
         self.tracks = tracks
 
         acc = np.zeros(3)
@@ -161,8 +167,10 @@ class BoidsNode(Node):
                 sep = (-P[close] / d[close, None] * k[:, None]).sum(axis=0)
                 sep[2] = 0.0
                 acc += self.w_sep * sep
-        if rel_vel:
-            acc += self.w_ali * np.mean(rel_vel, axis=0)
+        if nb_vel:
+            # v_self: blend of measured and commanded velocity (see docstring)
+            v_self = self.damp_meas * va + (1.0 - self.damp_meas) * self.vel
+            acc += self.w_ali * (np.mean(nb_vel, axis=0) - v_self)
 
         ready = self.fc_ready()
         if not ready:
