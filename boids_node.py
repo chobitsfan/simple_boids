@@ -19,11 +19,16 @@ Rules (all computed in the local frame, so the drone itself sits at 0,0,0):
   cohesion   -> steer toward the neighbors' centroid:        mean(p_i)
                 (separate horizontal and vertical gains; the vertical one keeps
                  neighbors inside the camera's narrow vertical view)
-  separation -> steer away from neighbors that are too close: sum(-p_i / |p_i|^2),
-                horizontal component only
-  alignment  -> match neighbors' velocity. Since p_i is relative, d(p_i)/dt is
-                (v_i - v_self) - w x p_i, where w is the body rate; the filter
-                removes the rotation part, leaving the alignment steering term.
+  separation -> steer away from neighbors closer than sep_dist:
+                sum(-p_i/|p_i| * (1/|p_i| - 1/sep_dist)), horizontal component only
+  alignment  -> match neighbors' velocity: v_i - v_self, where v_i is neighbor i's
+                ground velocity and v_self is ours (fc_vel), both in body axes (FLU).
+                Since p_i is relative, d(p_i)/dt = (v_i - v_self) - w x p_i
+                (w = body rate). The filter estimates v_i using v_self in its
+                prediction, and the steering uses the current v_self.
+                This keeps the damping of v_self out of the slow camera filter (in the
+                2026-11-25 flight the filtered relative velocity lagged ~0.24 s and the
+                damping loop oscillated at 0.4 Hz); a bias in fc_vel cancels out.
 """
 import numpy as np
 import rclpy
@@ -42,12 +47,15 @@ class BoidsNode(Node):
         # weights tuned in closed-loop sim with the measured drone response
         # (2026-11-19 DataFlash log: first-order lag 0.82 s + 0.12 s delay in x,
         #  1.0 s + 0.18 s in y; PSC_JERK_NE 5, WP_ACC 2.5)
-        self.sep_dist = p('separation_distance', 1.8).value
+        # separation fades to zero at sep_dist; with w_cohesion 0.25 a single neighbor
+        # settles at ~2.0 m (2026-11-25 flight delays: camera 0.04 s, fc_vel 0.06 s,
+        # our response x 0.46+0.08 s, y 0.12+0.30 s, z 0.30+0.28 s)
+        self.sep_dist = p('separation_distance', 2.4).value
         self.w_coh = p('w_cohesion', 0.25).value            # horizontal
         # vertical cohesion (match height); tuned on the 2026-11-19 16:03 flight replay:
-        # higher gains chase the apparent height change caused by A's own pitch
+        # higher gains chase the apparent height change caused by our own pitch
         self.w_height = p('w_height', 0.75).value
-        self.w_sep = p('w_separation', 4.0).value
+        self.w_sep = p('w_separation', 6.0).value
         self.w_ali = p('w_alignment', 3.0).value              # also damps closing speed
         self.max_speed = p('max_speed', 1.0).value          # [m/s]
         self.max_acc = p('max_accel', 2.0).value            # [m/s^2]
@@ -66,7 +74,7 @@ class BoidsNode(Node):
         self.require_rdy = p('require_fc_ready', True).value
 
         self.vel = np.zeros(3)   # current commanded velocity (local frame)
-        self.tracks = {}         # id -> (filtered position, filtered relative velocity, time)
+        self.tracks = {}         # id -> (filtered position, filtered neighbor velocity, time)
         self.last_t = None
         self.omega = np.zeros(3)  # own body rate [rad/s]
         self.v_meas = np.zeros(3)  # own velocity [m/s]
@@ -97,34 +105,36 @@ class BoidsNode(Node):
         now = self.get_clock().now().nanoseconds * 1e-9
         dt = 0.0 if self.last_t is None else min(now - self.last_t, self.timeout)
         self.last_t = now
-        # no (recent) fc_vel -> assume the frame does not rotate and A is not moving
+        # no (recent) fc_vel -> assume the frame does not rotate and we are not moving
         fc_ok = self.fc_t is not None and now - self.fc_t < self.timeout
         w = self.omega if fc_ok else np.zeros(3)
+        va = self.v_meas if fc_ok else np.zeros(3)
 
         pos, rel_vel, tracks = [], [], {}
         for m in msg.markers:
             if m.action != Marker.ADD:
                 continue
             z = np.array([m.pose.position.x, m.pose.position.y, m.pose.position.z])
-            q, v, valid_v = z, np.zeros(3), False
+            q, u, valid_v = z, va.copy(), False   # new track: assume it moves with us
             if m.id in self.tracks:
-                q0, v0, t0 = self.tracks[m.id]
+                q0, u0, t0 = self.tracks[m.id]
                 h = now - t0
                 if 0.0 < h < self.timeout:
-                    # alpha-beta filter: predict with constant velocity in a frame rotating
-                    # at w (both q and v rotate by -w x), correct with residual
-                    q_pred = q0 + (v0 - np.cross(w, q0)) * h
-                    v_pred = v0 - np.cross(w, v0) * h
+                    # alpha-beta filter on the neighbor's own velocity u (body axes):
+                    # predict q with the relative velocity u - va in a frame rotating at w
+                    # (q and u rotate by -w x), correct with the residual
+                    q_pred = q0 + (u0 - va - np.cross(w, q0)) * h
+                    u_pred = u0 - np.cross(w, u0) * h
                     r = z - q_pred
                     q = q_pred + self.alpha * r
-                    v = v_pred + (self.beta / h) * r
+                    u = u_pred + (self.beta / h) * r
                     valid_v = True
-            tracks[m.id] = (q, v, now)
+            tracks[m.id] = (q, u, now)
             if np.linalg.norm(q) > self.radius:
                 continue
             pos.append(q)
             if valid_v:
-                rel_vel.append(v)
+                rel_vel.append(u - va)
         self.tracks = tracks
 
         acc = np.zeros(3)
@@ -136,15 +146,19 @@ class BoidsNode(Node):
                 # turn toward the neighbors' horizontal bearing
                 rate = np.clip(self.yaw_gain * np.arctan2(c[1], c[0]),
                                -self.max_yaw_rate, self.max_yaw_rate)
-                yaw = float(rate * dt)
+                # cap dt: after a gap one late step would bypass max_yaw_rate
+                yaw = float(rate * min(dt, 0.1))
             acc += self.w_coh * np.array([c[0], c[1], 0.0])     # horizontal cohesion
             acc[2] += self.w_height * c[2]                      # height matching
             d = np.linalg.norm(P, axis=1)
             close = (d > 1e-6) & (d < self.sep_dist)
             if close.any():
                 # horizontal only: keep apart side by side instead of stacking
-                # (a neighbor in the camera view is never far above or below)
-                sep = (-P[close] / d[close, None] ** 2).sum(axis=0)
+                # (a neighbor in the camera view is never far above or below).
+                # (1/d - 1/sep_dist) falls to zero at sep_dist: a step there made us
+                # bounce in and out of it (no equilibrium with cohesion)
+                k = 1.0 / d[close] - 1.0 / self.sep_dist
+                sep = (-P[close] / d[close, None] * k[:, None]).sum(axis=0)
                 sep[2] = 0.0
                 acc += self.w_sep * sep
         if rel_vel:
@@ -157,7 +171,7 @@ class BoidsNode(Node):
             yaw = 0.0
         else:
             if not self.following:
-                # (re)entering Guided: continue from what A is actually doing
+                # (re)entering Guided: continue from what we are actually doing
                 self.vel = clamp(self.v_meas.copy(), self.max_speed) if fc_ok else np.zeros(3)
             # keep the previous command fixed in the world while the body rotates
             self.vel = self.vel - np.cross(w, self.vel) * dt
