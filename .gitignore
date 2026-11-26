@@ -1,0 +1,5 @@
+*.bin
+rosbag2_*/
+__pycache__/
+*.npy
+*.npz
