@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Minimal Reynolds (1986) boids controller for a single drone.
 
-Sub:  ~/neighbors (visualization_msgs/MarkerArray)
+Sub:  markers (visualization_msgs/MarkerArray)
       one marker per observed neighbor; only `id` and `pose.position` are used,
       position expressed in the drone's local frame (drone at origin).
 Sub:  fc_vel (geometry_msgs/TwistStamped), optional; drone's own velocity [m/s] in
